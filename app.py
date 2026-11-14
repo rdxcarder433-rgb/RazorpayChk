@@ -10,7 +10,7 @@ def health():
     return "", 200
 app.json.sort_keys = False
 
-base = "QGFmdW9uYXo="
+base = "QENBUkRFUnhSRFg="
 
 def show_base(dev):
     try:

